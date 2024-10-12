@@ -5,6 +5,7 @@
 # $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
 out_dir = experiment_name = wandb_run_name = 'nano_gpt_base'
+wandb_log = True
 wandb_notes = """Test of base implementation of nano_gpt"""
 wandb_project = "normalized_gpt_dev_sakle"
 
