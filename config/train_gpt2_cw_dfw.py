@@ -6,6 +6,7 @@
 
 out_dir = experiment_name = wandb_run_name = 'nano_gpt_base'
 wandb_notes = """Test of base implementation of nano_gpt"""
+wandb_project = "normalized_gpt_dev_sakle"
 
 data_root_path='/data/'
 dataset = 'nanoGPTopenwebtext'
