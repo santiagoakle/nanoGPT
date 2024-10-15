@@ -6,7 +6,6 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
-_SCALE_SAFEGUARD = 7.0E-3
 
 import math
 import inspect
@@ -15,207 +14,181 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
-    def __init__(self, ndim, bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
+    # Split the sinusoidal_pos into sin and cos parts
+    sin, cos = sinusoidal_pos.chunk(2, dim=-1)
+    # Apply the rotary embeddings to the query and key
+    q_rot = torch.stack((-q[..., 1::2], q[..., ::2]), dim=-1)
+    k_rot = torch.stack((-k[..., 1::2], k[..., ::2]), dim=-1)
+    q_rot = torch.reshape(q_rot, q.shape[:-1] + (q.shape[-1]//2, 2)) * torch.stack((cos, sin), dim=-1)
+    k_rot = torch.reshape(k_rot, k.shape[:-1] + (k.shape[-1]//2, 2)) * torch.stack((cos, sin), dim=-1)
+    q_rot = torch.reshape(q_rot, q.shape)
+    k_rot = torch.reshape(k_rot, k.shape)
+    return q_rot, k_rot
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # Query and key rescaling
-        self.key_scaling = nn.Parameter(torch.full(size=(config.n_head, config.n_embd//config.n_head), fill_value=1.0))
-        self.query_scaling = nn.Parameter(torch.full(size=(config.n_head, config.n_embd//config.n_head), fill_value=1.0))
-        self.scaling_constant = 1.0/math.sqrt(config.n_embd)
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                 .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-
-        # Normalize each query and key within each head
-        # q = q/q.norm(dim=-1, keepdim=True)
-
-        query_scaling = self.query_scaling * self.scaling_constant
-        q = q*query_scaling.reshape(1, self.n_head, 1, C // self.n_head)
-        # k = k/k.norm(dim=-1, keepdim=True)
-
-        key_scaling = self.key_scaling * self.scaling_constant
-        k = k * key_scaling.reshape(1, self.n_head, 1, C // self.n_head)
-        scaling_factor = math.sqrt(k.size(-1))
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            # Adjusted scaling factor
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None,
-                                                                 dropout_p=self.dropout if self.training else 0,
-                                                                 is_causal=True, scale=scaling_factor)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * scaling_factor  # Adjusted scaling factor
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-    def normalize_parameters(self):
-        # TODO: Determine what to do with the bias in the normalization step.
-        # TODO: it would also make sense to normalize the value matrix along the output embedding dimension rather
-        #  than the input embedding dimension.
-
-        # TODO: there is an ambiguity w.r.t the meaning of the embedding dimension for the projection matrix, we'll
-        #   assume it means the vectors that get linearly combined to produce the output
-
-        # normalize the qkv and the output projection matrices
-        with torch.no_grad():
-            embedding_dim = self.c_attn.in_features
-            qkv_attn_weight = self.c_attn.weight[:2*embedding_dim, :]
-            # Compute the row norm for the k qnd q components
-            scale_kq = qkv_attn_weight[:2*embedding_dim, :].norm(dim=-1, keepdim=True) + _SCALE_SAFEGUARD
-            qkv_attn_weight[:2*embedding_dim, :] = qkv_attn_weight[:2*embedding_dim, :] / scale_kq
-
-            # The value subset of the matrix should have normalized columns rather than rows!
-            scale_v = qkv_attn_weight[2 * embedding_dim:, :].norm(dim=-2, keepdim=True) + _SCALE_SAFEGUARD
-            qkv_attn_weight[2 * embedding_dim:, :] = qkv_attn_weight[2 * embedding_dim:, :] / scale_v
-
-            c_proj_weight = self.c_proj.weight
-            scale = c_proj_weight.norm(dim=-2, keepdim=True) + _SCALE_SAFEGUARD
-            c_proj_weight[:] = c_proj_weight / scale
-
-class MLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc_u    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_fc_v = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.silu = nn.SiLU()
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-        self.scale_u = nn.Parameter(torch.full(size=(4 * config.n_embd,), fill_value=1.0, requires_grad=True))
-        self.scale_v = nn.Parameter(torch.full(size=(4 * config.n_embd,), fill_value=1.0, requires_grad=True))
-        self.scale_v_constant = math.sqrt(config.n_embd)
-
-    def forward(self, x):
-        u = self.c_fc_u(x)
-        v = self.c_fc_v(x)
-        # Apply the scaling
-        u = u * self.scale_u.reshape(1, 1, -1)
-        v = v * self.scale_v.reshape(1, 1, -1) * self.scale_v_constant
-        # Compute SwiGLU
-        x = u*self.silu(v)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-    def normalize_parameters(self):
-        # Execute the normalization of MLP parameters
-        with torch.no_grad():
-            c_fc_u_weight = self.c_fc_u.weight
-            u_scale =  c_fc_u_weight.norm(dim=-1, keepdim=True) + _SCALE_SAFEGUARD
-            print(f"torch mean u_scale {torch.mean(u_scale)}, {u_scale.shape}")
-            c_fc_u_weight[:] = c_fc_u_weight/u_scale
-            c_fc_v_weight = self.c_fc_v.weight
-            v_scale =  c_fc_v_weight.norm(dim=-1, keepdim=True) + _SCALE_SAFEGUARD
-            print(f"torch mean v_scale {torch.mean(v_scale)}, {v_scale.shape}")
-            c_fc_v_weight[:] = c_fc_v_weight / v_scale
-            # The embedding dimension here is the output dimension
-            c_proj_weight = self.c_proj.weight
-            proj_scale = c_proj_weight.norm(dim=-2, keepdim=True) + _SCALE_SAFEGUARD
-            c_proj_weight[:] = c_proj_weight / proj_scale
-            print(f"torch mean proj_scale {torch.mean(proj_scale)}, {proj_scale.shape}")
+def get_sinusoidal_embeddings( n_positions, dim):
+    """Generate sinusoidal positional embeddings."""
+    position = torch.arange(n_positions, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+    sinusoidal_emb = torch.zeros((n_positions, dim))
+    sinusoidal_emb[:, 0::2] = torch.sin(position * div_term)
+    sinusoidal_emb[:, 1::2] = torch.cos(position * div_term)
+    return sinusoidal_emb
 
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, iblock):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
-        self.mlp = MLP(config)
-        # Interlayer step sizes "eigen step-size" we keep these rank 1 instead of [batch, seq, dim] so that
-        # they don't get added to the decay parameters
+        self.config = config
 
-        # The initialization should be roughly 1/n_layers
-        self.alpha_initial_scaling = 1.0 / math.sqrt(config.n_embd)
+        self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
+        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias)
+        self.silu    = nn.SiLU()
+        self.mlp_c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
 
-        self.alpha_forward_pass_scaling = math.sqrt(config.n_embd) / config.n_layer
+        if (config.use_nGPT == 0):
+            self.rmsnorm_att = RMSNorm(config.n_embd)
+            self.rmsnorm_mlp = RMSNorm(config.n_embd)
 
-        # According to the paper we initialize with alpha_scale and use alpha_init to rescale in the forward pass
-        self.alpha_attention = nn.Parameter(
-            torch.full(size=(config.n_embd,), fill_value=self.alpha_initial_scaling, requires_grad=True))
-        self.alpha_mlp = nn.Parameter(
-            torch.full(size=(config.n_embd,), fill_value=self.alpha_initial_scaling, requires_grad=True))
+        if (config.use_nGPT == 1):
+            self.attn_alpha_init_value = 0.05
+            self.attn_alpha_init_scaling = config.base_scale
+            self.attn_alpha = torch.nn.Parameter(self.attn_alpha_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
 
-    def forward(self, x):
-        # The forward pass becomes x<- h+alpha_a(h_A-h) = (1-alpha_a)h + alpha_a h_A, the same for the MLP residual step
-        # Normalizations of the activations will be differentiable, we introduce them in the forward computation.
-        ## Rescale the parameters
-        scaled_alpha_attention = self.alpha_attention * self.alpha_forward_pass_scaling
-        scaled_alpha_mlp = self.alpha_mlp * self.alpha_forward_pass_scaling
+            self.mlp_alpha_init_value = 0.05
+            self.mlp_alpha_init_scaling = config.base_scale
+            self.mlp_alpha = torch.nn.Parameter(self.mlp_alpha_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
 
-        x = (1.0 - scaled_alpha_attention[None, None, :]) * x + scaled_alpha_attention[None, None, :] * self.attn(x)
+            self.sqk_init_value = 1.0       
+            self.sqk_init_scaling = config.base_scale
+            self.sqk = torch.nn.Parameter(self.sqk_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
 
-        scale = x.norm(dim=-1, keepdim=True) + _SCALE_SAFEGUARD
-        x = x / scale
+            self.suv_init_value = 1.0
+            self.suv_init_scaling = 1.0
+            self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))
 
-        x = (1.0 - scaled_alpha_mlp[None, None, :]) * x + scaled_alpha_mlp[None, None, :] * self.mlp(x)
+    
+    def justnorm(self, x):
+        #return F.normalize(x, p=2, dim=-1)
+        res = x / x.norm(p=2, dim=-1, keepdim=True)
+        return res
 
-        scale = x.norm(dim=-1, keepdim=True) + _SCALE_SAFEGUARD
-        x = x / scale
+    def forward(self, h):
+        B, T, C = h.size()
 
-        return x
+        if (self.config.use_nGPT == 0):
+            h = self.rmsnorm_att(h)
+        
+        q = self.query(h)
+        k = self.key(h)
+        v = self.value(h)
 
-    def normalize_parameters(self):
-        # Call the submodules which have parameters to normalize
-        print(f"mean alpha attention  {self.alpha_attention.mean()}")
-        print(f"mean alpha mlp  {self.alpha_mlp.mean()}")
-        self.attn.normalize_parameters()
-        self.mlp.normalize_parameters()
+        q = q.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head) 
+        k = k.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
+        v = v.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
 
+        sinusoidal_pos = get_sinusoidal_embeddings(T, self.config.n_embd // self.config.n_head).to(device=q.device)
+        q, k = apply_rotary_position_embeddings(sinusoidal_pos, q.transpose(1, 2), k.transpose(1, 2))
+        q = q.transpose(2, 1)
+        k = k.transpose(2, 1)
+
+        if (self.config.use_nGPT == 1):
+            sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, 1, self.config.n_head, self.config.n_embd // self.config.n_head)
+            q = sqk * self.justnorm(q)  
+            k = sqk * self.justnorm(k)  
+
+        sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
+        if (self.config.use_nGPT == 0): softmax_scale = 1.0 / sqrt_head_dim 
+        if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim 
+        y = flash_attn_func(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
+        y = y.to(dtype=q.dtype)
+        y = y.contiguous().view(B, T, self.config.n_embd)
+
+
+        h_att = self.att_c_proj(y)
+
+        
+        if (self.config.use_nGPT == 0):
+            h = h + h_att
+        if (self.config.use_nGPT == 1):
+            lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
+            lr = torch.abs(lr)
+            
+            A_norm = self.justnorm(h) # normally, normalization is not needed
+            B_norm = self.justnorm(h_att)
+                
+            #res = (1.0 - lr) * A_norm + lr * B_norm
+            res = A_norm + lr * (B_norm - A_norm)
+            h = self.justnorm(res)
+
+    
+        if (self.config.use_nGPT == 0):
+            h = self.rmsnorm_mlp(h)
+        uv = self.c_fc(h)
+        if (self.config.use_nGPT == 1):
+            suv = (self.suv * ((self.suv_init_value/self.suv_init_scaling) * (self.config.n_embd ** 0.5))) 
+            uv = suv * uv  
+        u, v = torch.chunk(uv, 2, dim=-1)
+        x_mlp = u * self.silu(v)
+        h_mlp = self.mlp_c_proj(x_mlp)
+
+        if (self.config.use_nGPT == 0):
+            h = h + h_mlp
+        if (self.config.use_nGPT == 1):
+            lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
+            lr = torch.abs(lr)
+
+            A_norm = self.justnorm(h) # normally, normalization is not needed
+            B_norm = self.justnorm(h_mlp)
+                
+            #res = (1.0 - lr) * A_norm + lr * B_norm
+            res = A_norm + lr * (B_norm - A_norm)
+            h = self.justnorm(res)
+
+        return h
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    block_size: int = 1024 # = context/seqeunce length
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
-    n_embd: int = 768
+    n_embd: int = 1024
+    base_scale: float = 1.0 / (1024.0 ** 0.5)    # 1 / sqrt(n_embd) or init_std in the original GPT
+    use_nGPT: int = 0
     dropout: float = 0.0
-    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = False 
+
+class RMSNorm(torch.nn.Module):
+    """Root Mean Square Layer Normalization.
+
+    Derived from https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py. BSD 3-Clause License:
+    https://github.com/bzhangGo/rmsnorm/blob/master/LICENSE.
+    """
+
+    def __init__(self, size: int, dim: int = -1, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(size))
+        self.eps = eps
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = x.float()
+        # NOTE: the original RMSNorm paper implementation is not equivalent
+        norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
+        x_normed = x * torch.rsqrt(norm_x + self.eps)
+        x_normed = x_normed.to(dtype=dtype)
+        return x_normed * self.weight
 
 
 class GPT(nn.Module):
@@ -227,29 +200,34 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size, config.n_embd),
-            wpe=nn.Embedding(config.block_size, config.n_embd),
-            drop=nn.Dropout(config.dropout),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f=LayerNorm(config.n_embd, bias=config.bias),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config, il) for il in range(config.n_layer)])
         ))
-        self.logit_scale = nn.Parameter(torch.full(size=(config.vocab_size,), fill_value=1.0))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
+        #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
-
+                torch.nn.init.normal_(p, mean=0.0, std=config.base_scale/math.sqrt(2 * config.n_layer))
         # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+    
+        if (config.use_nGPT == 1):
+            self.sz_init_value = 1.00
+            self.sz_init_scaling = config.base_scale
+            self.sz = torch.nn.Parameter(self.sz_init_scaling*torch.ones(config.vocab_size, dtype=torch.float32))
+
+        if (config.use_nGPT == 0):
+            self.rmsnorm_f = RMSNorm(config.n_embd)
+
 
     def get_num_params(self, non_embedding=True):
         """
@@ -259,118 +237,48 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+        #if non_embedding:
+        #    n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.base_scale)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.base_scale)
 
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+        #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        # Normalize the word embeddings
-        w_emb_scale = x.norm(dim=-1, keepdim=True) + _SCALE_SAFEGUARD
-        x = x / w_emb_scale
-
-        for ix, block in enumerate(self.transformer.h):
-            print(f"layer ix {ix}")
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        
+        x = tok_emb
+        for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
 
-        logit_scaling = self.logit_scale.reshape(1, 1, -1)/math.sqrt(self.config.n_embd)
+        if (self.config.use_nGPT == 0):
+            x = self.rmsnorm_f(x)
+
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            logits = logits*logit_scaling
+            if (self.config.use_nGPT == 1):
+                sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
+                logits = sz * logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
-            logits = logits*logit_scaling
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            if (self.config.use_nGPT == 1):
+                sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
+                logits = sz * logits
             loss = None
 
         return logits, loss
 
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
-
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}  # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
-            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
-            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
-        config_args['bias'] = True  # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -391,66 +299,9 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+        use_fused = False#fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
-
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
-        flops_per_token = 6 * N + 12 * L * H * Q * T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
-        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
-
-    def normalize_parameters(self):
-        # Normalize our wte and wpe
-        wte = self.transformer['wte']
-        wpe = self.transformer['wpe']
-
-        with torch.no_grad():
-            wte.weight[:] = wte.weight / wte.weight.norm(dim=-1, keepdim=True)
-            wpe.weight[:] = wpe.weight / wpe.weight.norm(dim=-1, keepdim=True)
-
-        # Call all submodules that have parameters which need to be normalized.
-        for ix, block in enumerate(self.transformer['h']):
-            print(f"normalize layer {ix}")
-            block.normalize_parameters()
