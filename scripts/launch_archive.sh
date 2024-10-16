@@ -12,5 +12,5 @@ fi
 # Get the top commit from the checked out branch
 echo "Will submit $(git rev-parse HEAD) using ${LAUNCH_SCRIPT}"
 
-JOB_ID_ONE=$(sbatch --parsable --export=NANOGPT_GIT_REF="$(git rev-parse HEAD)" "${LAUNCH_SCRIPT}")
+JOB_ID_ONE=$(sbatch --parsable --export=NANOGPT_GIT_REF="$(git rev-parse HEAD)",HOME="${HOME}" "${LAUNCH_SCRIPT}")
 echo "Queued $JOB_ID_ONE"
