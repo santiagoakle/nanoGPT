@@ -33,8 +33,12 @@ from model import GPTConfig, GPT
 from torch.nn import functional as F
 from datetime import timedelta
 
+
 # -----------------------------------------------------------------------------
 # I/O
+
+experiment_name = 'port_illya_reference_corweweave'
+out_dir = f"/results/{experiment_name}"
 
 eval_interval = 1000
 log_interval = 10
@@ -43,11 +47,15 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True
+wandb_notes = """Reference run of illya's implementation in core weave"""
+wandb_project = "normalized_gpt_dev_sakle"
+wandb_run_name = experiment_name
+
 # data
-dataset = 'openwebtext'
+data_root_path='/data/'
+dataset = 'nanoGPTopenweb'
+
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # model
@@ -132,11 +140,9 @@ tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * bl
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 
-out_dir='./'
 if master_process:
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
-
 
 local_seed = seed_offset
 np.random.seed(local_seed)
@@ -153,10 +159,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 tdataloading_begin = time.time()
-if os.path.exists('./../../data'):
-    data_dir = os.path.join('./../../data', dataset)
-else:   
-    data_dir = os.path.join('data', dataset)
+data_dir = os.path.join(data_root_path, dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
