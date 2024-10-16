@@ -46,6 +46,7 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+
 # wandb logging
 wandb_log = True
 wandb_notes = """Reference run of illya's implementation in core weave"""
@@ -54,7 +55,7 @@ wandb_run_name = experiment_name
 
 # data
 data_root_path='/data/'
-dataset = 'nanoGPTopenweb'
+dataset = 'nanoGPTopenwebtext'
 
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
