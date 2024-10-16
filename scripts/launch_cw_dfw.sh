@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A llmservice_nemo_long-context
 #SBATCH --partition batch_short
-#SBATCH --nodes 1
+#SBATCH --nodes 2
 #SBATCH -t 2:00:00
 #SBATCH --exclusive # exclusive node access
 #SBATCH --mem=0 # all available memory
